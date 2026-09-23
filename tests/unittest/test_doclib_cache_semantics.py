@@ -1,4 +1,5 @@
 from __future__ import annotations
+from docvortex.document.pdf.layout import read_layout_geometry
 from docvortex.schema import Producer
 from mineru.integrations.docvortex import build_metadata
 from _span_test_utils import inline as _inline, inline_text
@@ -58,6 +59,7 @@ from mineru.doclib.services.parse_svc import (
     _resolve_parsing_rule_default_tier,
     expand_page_range,
     filter_pages_by_user_range,
+    load_middle_json_from_done_batches,
     load_pages_from_done_batches,
     parse_batch_json_path,
 )
@@ -281,16 +283,20 @@ def _write_batch(
     *,
     file_suffix: str = "pdf",
     is_full_document: bool = True,
+    layout_pages: list[dict] | None = None,
 ) -> None:
     path = Path(parse_batch_json_path(str(data_dir), sha256, tier, page_range, done_at))
     path.parent.mkdir(parents=True, exist_ok=True)
+    extensions: dict[str, Any] = {"mineru": {"tier": "basic", "parse_mode": "txt"}}
+    if layout_pages is not None:
+        extensions["docvortex_layout"] = {"version": 1, "pages": layout_pages}
     payload = {
         "schema_version": MIDDLE_JSON_SCHEMA_VERSION,
         "pages": json_pages,
         "is_full_document": is_full_document,
         "metadata": {"file_suffix": file_suffix, "producer": {"name": "mineru", "version": __version__}},
         "schema": "docvortex.middle",
-        "extensions": {"mineru": {"tier": "basic", "parse_mode": "txt"}},
+        "extensions": extensions,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=4), encoding="utf-8")
 
@@ -333,6 +339,73 @@ def test_load_pages_from_done_batches_keeps_newest_page_idx(tmp_path: Path) -> N
     assert inline_text(pages[1].blocks[0].content) == "newer"  # type: ignore[union-attr]
 
 
+def _text_page_at(page_idx: int, text: str) -> dict:
+    page = _text_page(text).to_dict(skip_defaults=True)
+    page["page_idx"] = page_idx
+    return page
+
+
+def test_load_middle_json_from_done_batches_merges_pages_and_layout_geometry(tmp_path: Path) -> None:
+    sha256 = "a" * 64
+    tier = "standard"
+    _write_batch(
+        tmp_path,
+        sha256,
+        tier,
+        "1-2",
+        1000,
+        [_text_page_at(0, "first"), _text_page_at(1, "older")],
+        layout_pages=[
+            {"page_idx": 0, "width_pt": 600.0, "height_pt": 800.0},
+            {"page_idx": 1, "width_pt": 600.0, "height_pt": 800.0},
+        ],
+    )
+    _write_batch(
+        tmp_path,
+        sha256,
+        tier,
+        "2",
+        2000,
+        [_text_page_at(1, "newer")],
+        layout_pages=[{"page_idx": 1, "width_pt": 800.0, "height_pt": 600.0}],
+    )
+    done_rows = [{"page_range": "2", "done_at": 2000}, {"page_range": "1-2", "done_at": 1000}]
+
+    merged = load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows)
+    document = MiddleJson.from_dict(merged)
+
+    assert [page.page_idx for page in document.pages] == [0, 1]
+    assert inline_text(document.pages[1].blocks[0].content) == "newer"  # type: ignore[union-attr]
+    assert read_layout_geometry(document) == {0: (600.0, 800.0), 1: (800.0, 600.0)}
+    assert merged["extensions"]["mineru"] == {"tier": "basic", "parse_mode": "txt"}
+
+    only_second = load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows, requested_page_numbers={2})
+    assert [page["page_idx"] for page in only_second["pages"]] == [1]
+    assert read_layout_geometry(MiddleJson.from_dict(only_second)) == {1: (800.0, 600.0)}
+
+
+def test_load_middle_json_from_done_batches_rejects_stale_or_inconsistent_batches(tmp_path: Path) -> None:
+    sha256 = "b" * 64
+    tier = "standard"
+    layout = [{"page_idx": 0, "width_pt": 600.0, "height_pt": 800.0}]
+    _write_batch(tmp_path, sha256, tier, "1", 1000, [_text_page_at(0, "ok")], layout_pages=layout)
+    broken = Path(parse_batch_json_path(str(tmp_path), sha256, tier, "2", 2000))
+    broken.write_text("{not json", encoding="utf-8")
+    done_rows = [{"page_range": "2", "done_at": 2000}, {"page_range": "1", "done_at": 1000}]
+
+    assert load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows, requested_page_numbers={1})["pages"]
+    with pytest.raises(MineruError) as stale_exc:
+        load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows)
+    assert stale_exc.value.code == "stale_cache"
+
+    _write_batch(tmp_path, sha256, tier, "2", 2000, [_text_page_at(1, "other")], file_suffix="epub")
+    with pytest.raises(MineruError) as mismatch_exc:
+        load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows)
+    assert mismatch_exc.value.code == "stale_cache"
+
+    with pytest.raises(NotFoundError) as missing_exc:
+        load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows[1:], requested_page_numbers={3})
+    assert missing_exc.value.code == "not_cached"
 
 
 def test_managed_api_server_args_use_tier_and_selected_port_for_process_start() -> None:
@@ -3709,6 +3782,16 @@ def test_doclib_server_accepts_short_id_for_sha256_doc_inputs(tmp_path: Path) ->
             short_id,
             DocContentExportRequest(tier="standard", page_range="1", output=str(export_path)),
         )
+        middle_path = tmp_path / "out.middle.json"
+        await server.export_doc_content(
+            short_id,
+            DocContentExportRequest(tier="standard", page_range="1", format="middle_json", output=str(middle_path)),
+        )
+        with pytest.raises(InvalidRequestError):
+            await server.export_doc_content(
+                short_id,
+                DocContentExportRequest(tier="standard", format="html", output=str(tmp_path / "out.html")),
+            )
         invalidated = await server.invalidate(InvalidateRequest(doc_ref=short_id, tier="standard"))
 
         assert doc_by_short_id.sha256 == sha256
@@ -3727,6 +3810,8 @@ def test_doclib_server_accepts_short_id_for_sha256_doc_inputs(tmp_path: Path) ->
         assert exported.sha256 == sha256
         assert exported.short_id == short_id
         assert export_path.read_text(encoding="utf-8")
+        exported_middle = MiddleJson.from_dict(json.loads(middle_path.read_text(encoding="utf-8")))
+        assert inline_text(exported_middle.pages[0].blocks[0].content) == "hello short id"  # type: ignore[union-attr]
         assert invalidated.sha256 == sha256
         assert invalidated.short_id == short_id
         assert invalidated.invalidated_count == 1

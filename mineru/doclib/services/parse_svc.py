@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import urlparse
 
-from ...errors import InvalidRequestError, MineruError
+from ...errors import InvalidRequestError, MineruError, NotFoundError
 from ...filetypes import (
     CSV_EXTENSIONS,
     IMAGE_EXTENSIONS,
@@ -36,7 +36,15 @@ from ...parser.page_range import (
     normalize_result_page_range,
     parse_page_range_set,
 )
-from ...types import QUALITY_TIERS, TIER_ORDER, PageInfo, Tier, select_default_quality_tier, select_parsing_rule_tier
+from ...types import (
+    QUALITY_TIERS,
+    TIER_ORDER,
+    MiddleJson,
+    PageInfo,
+    Tier,
+    select_default_quality_tier,
+    select_parsing_rule_tier,
+)
 from ..core.db import DatabaseManager
 from ..core.file_io import (
     FileStat,
@@ -1582,6 +1590,74 @@ def load_pages_from_done_batches(
             "stale_cache", "Cached document protocol is outdated or invalid; reparse the source document.", "page_range"
         )
     return [pages_by_page_idx[page_idx] for page_idx in sorted(pages_by_page_idx)]
+
+
+def load_middle_json_from_done_batches(
+    data_dir: str,
+    sha256: str,
+    tier: Tier,
+    done_rows: Sequence[ParseBatchRow],
+    *,
+    requested_page_numbers: set[int] | None = None,
+) -> dict:
+    """合并已完成批次为一份公开 Middle JSON；重复页与页面几何均以较新批次为准。"""
+    from docvortex.document.pdf.layout import LAYOUT_EXTENSION, merge_layout_extensions
+
+    pages_by_page_idx: dict[int, dict] = {}
+    envelope: dict = {}
+    stale_page_numbers: set[int] = set()
+    for row in reversed(done_rows):
+        fpath = parse_batch_json_path(data_dir, sha256, tier, row["page_range"], row["done_at"])
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                document = read_legacy_middle_json(json.load(f)).to_dict()
+        except (OSError, ValueError, TypeError):
+            stale_page_numbers.update(parse_page_range_set(row["page_range"]))
+            continue
+        batch_pages = document.pop("pages")
+        if not envelope:
+            envelope = document
+        else:
+            # 外层协议与产品信息必须一致，否则合并结果无法描述同一次解析。
+            previous = {key: value for key, value in envelope.items() if key != "extensions"}
+            current = {key: value for key, value in document.items() if key != "extensions"}
+            if json.dumps(previous, sort_keys=True) != json.dumps(current, sort_keys=True):
+                raise MineruError(
+                    "stale_cache",
+                    "Cached parse batches disagree on document metadata; reparse the source document.",
+                    "page_range",
+                )
+            try:
+                envelope["extensions"] = merge_layout_extensions(
+                    envelope["extensions"], document["extensions"], [page["page_idx"] for page in batch_pages]
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MineruError(
+                    "stale_cache", f"Cached parse batches have incompatible extensions: {exc}", "page_range"
+                ) from exc
+        for page in batch_pages:
+            pages_by_page_idx[page["page_idx"]] = page
+    uncovered_stale = stale_page_numbers - {index + 1 for index in pages_by_page_idx}
+    if requested_page_numbers is not None:
+        uncovered_stale &= requested_page_numbers
+    if uncovered_stale:
+        raise MineruError(
+            "stale_cache", "Cached document protocol is outdated or invalid; reparse the source document.", "page_range"
+        )
+    kept = sorted(index for index in pages_by_page_idx if requested_page_numbers is None or index + 1 in requested_page_numbers)
+    if not kept:
+        raise NotFoundError("not_cached", "Requested parsed content is not cached.", "page_range")
+    layout = envelope.get("extensions", {}).get(LAYOUT_EXTENSION)
+    if isinstance(layout, dict) and isinstance(layout.get("pages"), list):
+        wanted = set(kept)
+        envelope["extensions"][LAYOUT_EXTENSION] = {
+            **layout,
+            "pages": [page for page in layout["pages"] if page.get("page_idx") in wanted],
+        }
+    # 用公开 Schema 回读一次，保证对外输出与消费方的严格解析器一致。
+    return MiddleJson.from_dict({**envelope, "pages": [pages_by_page_idx[index] for index in kept]}).to_dict()
 
 
 def _done_response(sha256: str, short_id: str | None, tier: Tier, page_range: str) -> ParseResponse:

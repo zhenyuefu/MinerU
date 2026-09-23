@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import re
@@ -75,6 +76,7 @@ from .services.parse_svc import (
     _json_batch_is_readable,
     accessible_file_for_sha256,
     filter_pages_by_user_range,
+    load_middle_json_from_done_batches,
     load_pages_from_done_batches,
     parse_page_range_set,
 )
@@ -1227,8 +1229,8 @@ class DoclibServer(AsyncDoclibInterface):
         format: str,
         no_marker: bool,
     ) -> str:
-        if format != "markdown":
-            raise InvalidRequestError("invalid_request", "Only markdown is currently implemented.", "format")
+        if format not in ("markdown", "middle_json"):
+            raise InvalidRequestError("invalid_request", "Only markdown and middle_json exports are implemented.", "format")
         data_dir = _effective_data_dir(self.state)
         rows = await self.state.db.fetchall(
             "SELECT page_range, done_at FROM parses WHERE sha256=? AND tier=? AND status=? ORDER BY done_at DESC",
@@ -1241,6 +1243,16 @@ class DoclibServer(AsyncDoclibInterface):
         if page_range and doc["page_count"] is not None:
             page_range = _expand_page_range(page_range, doc["page_count"])
         requested = parse_page_range_set(page_range) if page_range and page_range != "all" else None
+        if format == "middle_json":
+            # 完整公开 envelope（含 extensions.docvortex_layout），供下游按页面几何重建版面。
+            middle_json = load_middle_json_from_done_batches(
+                data_dir,
+                sha256,
+                tier,
+                cast(list[ParseBatchRow], rows),
+                requested_page_numbers=requested,
+            )
+            return json.dumps(middle_json, ensure_ascii=False)
         loaded_pages = load_pages_from_done_batches(
             data_dir,
             sha256,
