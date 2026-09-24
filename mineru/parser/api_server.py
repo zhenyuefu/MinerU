@@ -2505,7 +2505,8 @@ def _build_server_log_config(log_level: str) -> dict[str, Any]:
 )
 @click.option(
     "--upload-dir",
-    default="",
+    # None, not "": click validates defaults, and "" would resolve to the cwd and fail when it is read-only.
+    default=None,
     help="Upload directory (default: auto-created temp dir)",
     type=click.Path(file_okay=False, writable=True, resolve_path=True),
 )
@@ -2590,7 +2591,7 @@ def _build_server_log_config(log_level: str) -> dict[str, Any]:
 def main(
     host: str,
     port: int,
-    upload_dir: str,
+    upload_dir: str | None,
     tier: ServerTier | None,
     no_flash: bool,
     no_advanced: bool,
