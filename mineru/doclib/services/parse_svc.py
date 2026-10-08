@@ -1559,6 +1559,23 @@ def parse_batch_json_path(data_dir: str, sha256: str, tier: Tier, page_range: st
     return os.path.join(os.path.expanduser(data_dir), "parsed", sha256[:2], sha256, tier, filename)
 
 
+def batch_envelopes_agree(previous: dict, current: dict) -> bool:
+    """批次外层协议与产品信息是否一致，否则合并结果无法描述同一次解析。
+
+    extensions 由调用方逐页合并；is_full_document 只描述单个批次的页面范围，整本批次与
+    强制重解析的分页批次可以共存，合并后的值由调用方按实际覆盖的页面重算。
+    """
+    ignored = {"pages", "extensions", "is_full_document"}
+    return json.dumps({k: v for k, v in previous.items() if k not in ignored}, sort_keys=True) == json.dumps(
+        {k: v for k, v in current.items() if k not in ignored}, sort_keys=True
+    )
+
+
+def full_document_claim_is_consistent(is_full_document: bool, page_indices: Sequence[int]) -> bool:
+    """声称整本的批次必须从第一页起连续，否则其整本语义不可信，不能参与合并。"""
+    return not is_full_document or list(page_indices) == list(range(len(page_indices)))
+
+
 def load_pages_from_done_batches(
     data_dir: str,
     sha256: str,
@@ -1599,13 +1616,18 @@ def load_middle_json_from_done_batches(
     done_rows: Sequence[ParseBatchRow],
     *,
     requested_page_numbers: set[int] | None = None,
+    page_count: int | None = None,
 ) -> dict:
-    """合并已完成批次为一份公开 Middle JSON；重复页与页面几何均以较新批次为准。"""
+    """合并已完成批次为一份公开 Middle JSON；重复页与页面几何均以较新批次为准。
+
+    is_full_document 按合并结果重算：整本批次的页数优先，其次是 page_count；两者都未知时视为非整本。
+    """
     from docvortex.document.pdf.layout import LAYOUT_EXTENSION, merge_layout_extensions
 
     pages_by_page_idx: dict[int, dict] = {}
     envelope: dict = {}
     stale_page_numbers: set[int] = set()
+    full_document_page_count: int | None = None
     for row in reversed(done_rows):
         fpath = parse_batch_json_path(data_dir, sha256, tier, row["page_range"], row["done_at"])
         if not os.path.isfile(fpath):
@@ -1617,13 +1639,19 @@ def load_middle_json_from_done_batches(
             stale_page_numbers.update(parse_page_range_set(row["page_range"]))
             continue
         batch_pages = document.pop("pages")
+        if not full_document_claim_is_consistent(document["is_full_document"], [page["page_idx"] for page in batch_pages]):
+            raise MineruError(
+                "stale_cache",
+                "Cached parse batch claims the full document but does not start at the first page; "
+                "reparse the source document.",
+                "page_range",
+            )
+        if document["is_full_document"]:
+            full_document_page_count = len(batch_pages)
         if not envelope:
             envelope = document
         else:
-            # 外层协议与产品信息必须一致，否则合并结果无法描述同一次解析。
-            previous = {key: value for key, value in envelope.items() if key != "extensions"}
-            current = {key: value for key, value in document.items() if key != "extensions"}
-            if json.dumps(previous, sort_keys=True) != json.dumps(current, sort_keys=True):
+            if not batch_envelopes_agree(envelope, document):
                 raise MineruError(
                     "stale_cache",
                     "Cached parse batches disagree on document metadata; reparse the source document.",
@@ -1656,6 +1684,8 @@ def load_middle_json_from_done_batches(
             **layout,
             "pages": [page for page in layout["pages"] if page.get("page_idx") in wanted],
         }
+    document_page_count = full_document_page_count or page_count
+    envelope["is_full_document"] = document_page_count is not None and set(range(document_page_count)) <= set(kept)
     # 用公开 Schema 回读一次，保证对外输出与消费方的严格解析器一致。
     return MiddleJson.from_dict({**envelope, "pages": [pages_by_page_idx[index] for index in kept]}).to_dict()
 

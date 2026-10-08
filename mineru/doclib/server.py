@@ -1251,6 +1251,7 @@ class DoclibServer(AsyncDoclibInterface):
                 tier,
                 cast(list[ParseBatchRow], rows),
                 requested_page_numbers=requested,
+                page_count=doc["page_count"],
             )
             return json.dumps(middle_json, ensure_ascii=False)
         loaded_pages = load_pages_from_done_batches(

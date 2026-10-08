@@ -16,7 +16,12 @@ from ...types import Tier
 from ..core.db import DatabaseManager
 from ...backend.postprocess.legacy_middle_json import read_legacy_middle_json
 from ..rows import ParseBatchRow, ParseGroupRow, ParseRow
-from ..services.parse_svc import parse_batch_json_path, parse_page_range_set
+from ..services.parse_svc import (
+    batch_envelopes_agree,
+    full_document_claim_is_consistent,
+    parse_batch_json_path,
+    parse_page_range_set,
+)
 from ..types import PARSE_STATUS_DONE, PARSE_STATUS_SUPERSEDED
 
 logger = logging.getLogger("mineru.compaction")
@@ -162,16 +167,20 @@ class Compaction:
                     return None
                 pages_by_page_idx[page_idx] = page
             current_envelope = {key: value for key, value in middle_json.to_dict().items() if key != "pages"}
+            if not full_document_claim_is_consistent(
+                current_envelope["is_full_document"], [page["page_idx"] for page in batch_pages]
+            ):
+                return None
             if not envelope:
                 envelope = current_envelope
             else:
                 from docvortex.document.pdf.layout import merge_layout_extensions
 
                 # 页面几何随批次变化；其他外层协议和产品信息仍须严格相同。
-                previous_fields = {key: value for key, value in envelope.items() if key != "extensions"}
-                current_fields = {key: value for key, value in current_envelope.items() if key != "extensions"}
-                if json.dumps(previous_fields, sort_keys=True) != json.dumps(current_fields, sort_keys=True):
+                if not batch_envelopes_agree(envelope, current_envelope):
                     return None
+                # 任一整本批次已覆盖全部页面，强制重解析的分页批次只替换其中的页。
+                envelope["is_full_document"] = envelope["is_full_document"] or current_envelope["is_full_document"]
                 try:
                     envelope["extensions"] = merge_layout_extensions(
                         envelope["extensions"], current_envelope["extensions"], [page["page_idx"] for page in batch_pages]
@@ -201,7 +210,11 @@ class Compaction:
                     raise ValueError(f"Compacted page range has no source pages: {page_range}")
                 final_path = parse_batch_json_path(self.data_dir, sha256, tier, page_range, max_done_at)
                 temp_path = f"{final_path}.tmp-{time.time_ns()}"
-                payload = ParseResult.from_dict({**envelope, "pages": json_pages}).to_dict()
+                # 多个压缩区间时每个文件只含部分页面，不能声称是整本。
+                is_full_document = envelope["is_full_document"] and len(merged_ranges) == 1
+                payload = ParseResult.from_dict(
+                    {**envelope, "is_full_document": is_full_document, "pages": json_pages}
+                ).to_dict()
                 with open(temp_path, "w", encoding="utf-8") as f:
                     json.dump(payload, f, ensure_ascii=False, indent=2)
                 prepared.append((temp_path, final_path))

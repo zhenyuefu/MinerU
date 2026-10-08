@@ -367,6 +367,7 @@ def test_load_middle_json_from_done_batches_merges_pages_and_layout_geometry(tmp
         "2",
         2000,
         [_text_page_at(1, "newer")],
+        is_full_document=False,
         layout_pages=[{"page_idx": 1, "width_pt": 800.0, "height_pt": 600.0}],
     )
     done_rows = [{"page_range": "2", "done_at": 2000}, {"page_range": "1-2", "done_at": 1000}]
@@ -406,6 +407,95 @@ def test_load_middle_json_from_done_batches_rejects_stale_or_inconsistent_batche
     with pytest.raises(NotFoundError) as missing_exc:
         load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows[1:], requested_page_numbers={3})
     assert missing_exc.value.code == "not_cached"
+
+
+def _write_full_batch_with_forced_page(data_dir: Path, sha256: str, tier: Tier) -> list[dict]:
+    """整本批次之后再强制重解析第 2 页，两批次共存于同一档位。"""
+    _write_batch(
+        data_dir,
+        sha256,
+        tier,
+        "1-3",
+        1000,
+        [_text_page_at(0, "first"), _text_page_at(1, "older"), _text_page_at(2, "third")],
+        is_full_document=True,
+        layout_pages=[{"page_idx": index, "width_pt": 600.0, "height_pt": 800.0} for index in range(3)],
+    )
+    _write_batch(
+        data_dir,
+        sha256,
+        tier,
+        "2",
+        2000,
+        [_text_page_at(1, "forced")],
+        is_full_document=False,
+        layout_pages=[{"page_idx": 1, "width_pt": 800.0, "height_pt": 600.0}],
+    )
+    return [{"page_range": "2", "done_at": 2000}, {"page_range": "1-3", "done_at": 1000}]
+
+
+def test_load_middle_json_merges_full_document_batch_with_forced_page_batch(tmp_path: Path) -> None:
+    sha256 = "f" * 64
+    tier = "standard"
+    done_rows = _write_full_batch_with_forced_page(tmp_path, sha256, tier)
+
+    whole = load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows)
+    document = MiddleJson.from_dict(whole)
+    assert whole["is_full_document"] is True
+    assert [page.page_idx for page in document.pages] == [0, 1, 2]
+    assert inline_text(document.pages[1].blocks[0].content) == "forced"  # type: ignore[union-attr]
+    assert read_layout_geometry(document) == {0: (600.0, 800.0), 1: (800.0, 600.0), 2: (600.0, 800.0)}
+
+    all_pages = load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows, requested_page_numbers={1, 2, 3})
+    assert all_pages["is_full_document"] is True
+
+    page_two = load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows, requested_page_numbers={2})
+    assert page_two["is_full_document"] is False
+    assert [page["page_idx"] for page in page_two["pages"]] == [1]
+    assert read_layout_geometry(MiddleJson.from_dict(page_two)) == {1: (800.0, 600.0)}
+
+
+def test_load_middle_json_full_document_flag_uses_page_count_without_full_batch(tmp_path: Path) -> None:
+    sha256 = "e" * 64
+    tier = "standard"
+    _write_batch(tmp_path, sha256, tier, "1", 1000, [_text_page_at(0, "one")], is_full_document=False)
+    _write_batch(
+        tmp_path, sha256, tier, "2-3", 2000, [_text_page_at(1, "two"), _text_page_at(2, "three")], is_full_document=False
+    )
+    done_rows = [{"page_range": "2-3", "done_at": 2000}, {"page_range": "1", "done_at": 1000}]
+
+    assert load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows, page_count=3)["is_full_document"]
+    assert not load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows, page_count=4)["is_full_document"]
+    assert not load_middle_json_from_done_batches(str(tmp_path), sha256, tier, done_rows)["is_full_document"]
+
+
+def test_compaction_merges_full_document_batch_with_forced_page_batch(tmp_path: Path) -> None:
+    async def _run() -> None:
+        sha256 = "f" * 64
+        tier: Tier = "standard"
+        db = DatabaseManager(str(tmp_path / "doclib.db"))
+        await db.initialize()
+        await db.execute(
+            "INSERT INTO docs (sha256, short_id, size_bytes, file_type, page_count, first_seen_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (sha256, "fffffff", 1, "pdf", 3, 1, 1),
+        )
+        for row in _write_full_batch_with_forced_page(tmp_path, sha256, tier):
+            await db.execute(
+                "INSERT INTO parses (sha256, tier, page_range, status, done_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sha256, tier, row["page_range"], "done", row["done_at"], row["done_at"], row["done_at"]),
+            )
+
+        compaction = Compaction(db=db, interval_sec=600, data_dir=str(tmp_path))
+        assert await compaction._compact_doc_tier(sha256, tier) == 1
+
+        compacted_path = Path(parse_batch_json_path(str(tmp_path), sha256, tier, "1-3", 2000))
+        compacted = json.loads(compacted_path.read_text(encoding="utf-8"))
+        assert compacted["is_full_document"] is True
+        assert inline_text(MiddleJson.from_dict(compacted).pages[1].blocks[0].content) == "forced"  # type: ignore[union-attr]
+
+    asyncio.run(_run())
 
 
 def test_managed_api_server_args_use_tier_and_selected_port_for_process_start() -> None:
@@ -1437,7 +1527,7 @@ def test_compaction_uses_configured_data_dir(tmp_path: Path) -> None:
     }
 
     _write_batch(tmp_path, sha256, tier, "1-2", 1000, [older_page, older_duplicate])
-    _write_batch(tmp_path, sha256, tier, "2", 2000, [newer_duplicate])
+    _write_batch(tmp_path, sha256, tier, "2", 2000, [newer_duplicate], is_full_document=False)
 
     compaction = Compaction(db=None, interval_sec=600, data_dir=str(tmp_path))
     done_rows = [
@@ -3726,6 +3816,53 @@ def test_doclib_server_list_responses_include_pagination_metadata(tmp_path: Path
         assert docs.limit == 1
         assert docs.offset == 1
         assert len(docs.docs) == 1
+
+    asyncio.run(_run())
+
+
+def test_doclib_server_exports_middle_json_after_forced_page_parse(tmp_path: Path) -> None:
+    async def _run() -> None:
+        db = DatabaseManager(str(tmp_path / "doclib.db"))
+        await db.initialize()
+        parse_svc = ParseService(
+            db=db,
+            fts=FTSManager(db),
+            config_svc=ConfigService(db),
+            data_dir=str(tmp_path),
+            parse_lock_timeout_sec=1800,
+        )
+        server = DoclibServer(SimpleNamespace(db=db, data_dir=str(tmp_path), parse_svc=parse_svc))
+        sha256 = "f" * 64
+        short_id = "fffffff"
+        await db.execute(
+            "INSERT INTO docs (sha256, short_id, size_bytes, file_type, page_count, first_seen_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (sha256, short_id, 12, "pdf", 3, 1, 1),
+        )
+        for row in _write_full_batch_with_forced_page(tmp_path, sha256, "standard"):
+            await db.execute(
+                "INSERT INTO parses (sha256, tier, page_range, status, privacy, done_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (sha256, "standard", row["page_range"], "done", "local", row["done_at"], row["done_at"], row["done_at"]),
+            )
+
+        whole_path = tmp_path / "whole.middle.json"
+        await server.export_doc_content(
+            short_id, DocContentExportRequest(tier="standard", format="middle_json", output=str(whole_path))
+        )
+        page_path = tmp_path / "page.middle.json"
+        await server.export_doc_content(
+            short_id,
+            DocContentExportRequest(tier="standard", page_range="2", format="middle_json", output=str(page_path)),
+        )
+
+        whole = json.loads(whole_path.read_text(encoding="utf-8"))
+        page = json.loads(page_path.read_text(encoding="utf-8"))
+        assert whole["is_full_document"] is True
+        assert [item["page_idx"] for item in whole["pages"]] == [0, 1, 2]
+        assert inline_text(MiddleJson.from_dict(whole).pages[1].blocks[0].content) == "forced"  # type: ignore[union-attr]
+        assert page["is_full_document"] is False
+        assert [item["page_idx"] for item in page["pages"]] == [1]
 
     asyncio.run(_run())
 
