@@ -146,3 +146,24 @@ def test_log_configuration_is_independent() -> None:
     assert fresh["loggers"]["uvicorn"]["level"] == 20
     assert "root" not in fresh
     assert fresh["disable_existing_loggers"] is False
+
+
+@pytest.mark.parametrize("entrypoint", ["module", "kit", "alias"])
+def test_default_upload_dir_does_not_depend_on_cwd(monkeypatch: pytest.MonkeyPatch, tmp_path: Any, entrypoint: str) -> None:
+    """不传 --upload-dir 时即使当前目录只读也能启动（例如从 Finder 打开的应用工作目录为 /）。"""
+    readonly = tmp_path / "readonly"
+    readonly.mkdir()
+    readonly.chmod(0o555)
+    create_app = MagicMock(return_value=object())
+    monkeypatch.setattr(api_server, "create_app", create_app)
+    monkeypatch.setattr(api_server.uvicorn, "Config", MagicMock(return_value=object()))
+    monkeypatch.setattr(
+        api_server.uvicorn, "Server", MagicMock(return_value=SimpleNamespace(run=MagicMock(), should_exit=False))
+    )
+    monkeypatch.setattr(api_server.ManagedProcessControlWatcher, "from_environment", lambda callback: None)
+    monkeypatch.chdir(readonly)
+    try:
+        assert _invoke_entrypoint(monkeypatch, entrypoint, []) == 0
+    finally:
+        readonly.chmod(0o755)
+    assert not create_app.call_args.kwargs["upload_dir"]
