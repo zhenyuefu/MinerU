@@ -127,6 +127,39 @@ def _build_formula_inputs(images_layout_res: list[list[dict[str, Any]]]) -> list
     return formula_inputs
 
 
+def collect_inline_formula_boxes(
+    page_inline_formula_list: list[dict[str, Any]],
+    page_size: tuple[float, float],
+) -> list[dict[str, Any]]:
+    """导出一页行内公式的位置（0-1 坐标，左上原点）、识别分数与 LaTeX。
+
+    写进 docvortex_layout 的页面几何，供下游按字形位置保护公式（如 PDF 版面重建）；Middle JSON 的
+    equation_inline 只保留 LaTeX。保留四位小数：三位约 0.6 pt，足以切掉角标边缘的字形。
+    """
+    width, height = page_size
+    formulas: list[dict[str, Any]] = []
+    if width <= 0 or height <= 0:
+        return formulas
+    for formula in page_inline_formula_list:
+        bbox = _normalize_hybrid_formula_bbox(formula.get("bbox"))
+        if bbox is None:
+            continue
+        x0, y0, x1, y1 = (
+            round(max(0.0, min(1.0, value / size)), 4)
+            for value, size in zip(bbox, (width, height, width, height), strict=True)
+        )
+        if x1 <= x0 or y1 <= y0:
+            continue
+        formulas.append(
+            {
+                "bbox": [x0, y0, x1, y1],
+                "score": round(float(formula.get("score", 0.0) or 0.0), 3),
+                "latex": str(formula.get("latex", "") or "").strip(),
+            }
+        )
+    return formulas
+
+
 def _split_formula_results(
     images_formula_list: list[list[dict[str, Any]]],
 ) -> tuple[list[list[dict[str, Any]]], list[list[dict[str, Any]]]]:

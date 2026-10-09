@@ -181,6 +181,8 @@ def test_doc_analyze_converts_vlm_results_before_downstream_processing(
         *,
         page_vector_geometries: object,
         np_images: object,
+        inline_formulas: dict | None = None,
+        page_start: int = 0,
     ) -> list[list[dict[str, object]]]:
         """原样返回窗口结果，并在后处理入口校验精确容器类型。"""
         assert type(window_model_list) is list

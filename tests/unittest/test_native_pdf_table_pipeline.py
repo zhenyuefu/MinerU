@@ -507,6 +507,8 @@ def test_high_txt_window_excludes_native_table_from_vlm(
         *,
         page_vector_geometries: object,
         np_images: object,
+        inline_formulas: dict | None = None,
+        page_start: int = 0,
     ) -> list[list[dict[str, object]]]:
         """跳过与本测试无关的正文和公式回填。"""
 
