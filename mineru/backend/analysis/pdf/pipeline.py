@@ -90,6 +90,7 @@ def analyze_pdf(
         with stage_timer("pdf.prepare"):
             _prepare_analysis(state, file_bytes, effort, parse_mode, vlm_config)
         infer_started_at = time.perf_counter()
+        inline_formulas: dict[int, list] = {}
         model_list = process_pdf_windows(
             file_bytes,
             state.document,
@@ -99,8 +100,9 @@ def analyze_pdf(
             flash_txt_mode=state.flash_txt_mode,
             hybrid_model=state.hybrid_model,
             vlm_predictor=state.predictor,
+            inline_formulas=inline_formulas,
         )
-        result = _build_pdf_analysis_result(state, model_list, effort, infer_started_at)
+        result = _build_pdf_analysis_result(state, model_list, effort, infer_started_at, inline_formulas)
     finally:
         with stage_timer("pdf.cleanup"):
             _close_analysis(state)
@@ -121,6 +123,7 @@ async def aio_analyze_pdf(
         if state.document is None or state.hybrid_model is None or state.predictor is None:
             raise ValueError("Native async PDF analysis requires a high/xhigh VLM pipeline")
         infer_started_at = time.perf_counter()
+        inline_formulas: dict[int, list] = {}
         model_list = await aio_process_pdf_windows(
             file_bytes,
             state.document,
@@ -129,17 +132,24 @@ async def aio_analyze_pdf(
             image_analysis=image_analysis,
             hybrid_model=state.hybrid_model,
             vlm_predictor=state.predictor,
+            inline_formulas=inline_formulas,
         )
-        result = await run_sync(_build_pdf_analysis_result, state, model_list, effort, infer_started_at)
+        result = await run_sync(
+            _build_pdf_analysis_result, state, model_list, effort, infer_started_at, inline_formulas
+        )
     finally:
         await run_sync(_close_analysis, state)
     return result
 
 
 def _build_pdf_analysis_result(
-    state: _PDFAnalysis, model_list: list, effort: AnalyzeEffort, started_at: float
+    state: _PDFAnalysis,
+    model_list: list,
+    effort: AnalyzeEffort,
+    started_at: float,
+    inline_formulas: dict[int, list] | None = None,
 ) -> AnalysisResult:
-    """规范化模型结果，并在关闭现有 PDF 之前汇集各档位页面几何与裁图方向。"""
+    """规范化模型结果，并在关闭现有 PDF 之前汇集各档位页面几何、裁图方向与行内公式框。"""
     from docvortex.document.pdf.layout import extract_layout_geometry, attach_layout_image_rotations
 
     assert state.document is not None
@@ -151,9 +161,21 @@ def _build_pdf_analysis_result(
         geometry, diagnostics = extract_layout_geometry(state.document, None)
     rotation_pages = [[{**block, "angle": angles.get(id(block), 0)} for block in page] for page in model_list]
     attach_layout_image_rotations(geometry, rotation_pages, None)
+    attach_inline_formulas(geometry, inline_formulas or {})
     for diagnostic in diagnostics:
         logger.warning("{}: {}", diagnostic.code, diagnostic.message)
     return AnalysisResult(model_list, effort, state.parse_mode, elapsed, geometry)
+
+
+def attach_inline_formulas(geometry: dict, inline_formulas: dict[int, list]) -> None:
+    """把各页行内公式框写进页面几何（键 inline_formulas）；没跑版面模型的页不写，空列表表示没检出。
+
+    页面几何随批次合并与页号重映射原样复制，不需要另一个文档扩展。
+    """
+    for page in geometry["pages"]:
+        formulas = inline_formulas.get(page["page_idx"])
+        if formulas is not None:
+            page["inline_formulas"] = formulas
 
 
 __all__ = ["analyze_pdf", "aio_analyze_pdf"]

@@ -254,6 +254,8 @@ def hybrid_stub(monkeypatch: pytest.MonkeyPatch) -> None:
         page_vector_geometries: object,
         np_images: object,
         page_snapshots: object = None,
+        inline_formulas: object = None,
+        page_start: int = 0,
     ) -> list[list[dict[str, Any]]]:
         """保留远程正文并模拟 Hybrid 提供的行框，满足 PDF 文本块校验合同。"""
         for page in blocks:
